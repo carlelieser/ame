@@ -1,8 +1,6 @@
-- Only one copy of Ame can run now — opening it again brings up the one already running instead of starting a second one that broke both
-- Ame connects much faster, especially when you are already in champion select
-- Fixed Ame sometimes never showing up in champion select if it started while the client was still loading
-- Fixed Ame not detecting the League client at all on recent Windows 11 updates
-- Fixed Ame freezing on startup when the League client was patching or stuck
-- Fixed a slow startup on PCs with disconnected network drives
-- Ame no longer accepts connections from other computers on your network
-- Updates no longer leave a leftover skin process running behind
+- Fixed skins not showing in game after the latest League patch
+- Fixed the game freezing on startup when a skin was selected
+- Skins now keep working after future League patches without waiting for an Ame update
+- Ame now downloads its skin tools straight from their official source
+- Added a log file that helps track down problems when a skin doesn't show up in game
+- Updates and downloads now come from this version of Ame
