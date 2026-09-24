@@ -18,7 +18,7 @@ A League of Legends skin changer for Windows. Lets you select and apply skins di
 
 ## Installation
 
-Download `ame.exe` from the [releases page](https://github.com/hoangvu12/ame/releases) and run it. First-run setup is automatic.
+Download `ame.exe` from the [releases page](https://github.com/carlelieser/ame/releases) and run it. First-run setup is automatic.
 
 To uninstall, run `uninstall.bat` included in the release.
 

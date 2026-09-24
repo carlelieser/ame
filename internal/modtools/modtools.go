@@ -12,9 +12,13 @@ import (
 	"time"
 
 	"github.com/hoangvu12/ame/internal/config"
+	"github.com/hoangvu12/ame/internal/display"
 )
 
-// overlayStatus tracks the latest status line from runoverlay stdout.
+// hookedStatus is the overlay status once the hook DLL is serving the overlay.
+const hookedStatus = "waiting"
+
+// overlayStatus tracks the latest injection state reported by the patcher host.
 var overlayStatus string
 var overlayStatusMu sync.Mutex
 
@@ -24,22 +28,22 @@ func setOverlayStatus(s string) {
 	overlayStatusMu.Unlock()
 }
 
-// IsHooked returns true if runoverlay has already installed the hook.
+// IsHooked returns true if the patcher has already installed the hook.
 func IsHooked() bool {
 	overlayStatusMu.Lock()
 	defer overlayStatusMu.Unlock()
-	return overlayStatus == "Waiting for exit"
+	return overlayStatus == hookedStatus
 }
 
-// WaitForHook blocks until runoverlay reports the hook is installed
-// (status == "Waiting for exit") or the timeout expires.
+// WaitForHook blocks until the patcher reports the hook is installed
+// or the timeout expires.
 func WaitForHook(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		overlayStatusMu.Lock()
 		status := overlayStatus
 		overlayStatusMu.Unlock()
-		if status == "Waiting for exit" {
+		if status == hookedStatus {
 			return true
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -47,41 +51,62 @@ func WaitForHook(timeout time.Duration) bool {
 	return false
 }
 
-// Running process reference (like bocchi's this.runningProcess)
-var runningProcess *exec.Cmd
+// hostMu guards the patcher host process and whether an overlay is armed.
+var hostMu sync.Mutex
 
-// KillModTools kills any running mod-tools processes
+// hostProcess is the long-lived patcher host. It keeps scanning for the game
+// between matches: the hook DLL only overlays when it attaches as the game
+// starts, so the host must already be waiting when League launches.
+var hostProcess *exec.Cmd
+
+// armed is true while an overlay built by ame is meant to be in the game.
+var armed bool
+
+// KillModTools disarms the overlay and kills any running mod-tools. The
+// patcher host keeps running; see StopPatcher.
 func KillModTools() {
-	// First try to gracefully stop by writing to stdin (like bocchi)
-	if stdinPipe != nil {
-		stdinPipe.Write([]byte("\n"))
-		stdinPipe.Close()
-		stdinPipe = nil
+	hostMu.Lock()
+	armed = false
+	hostMu.Unlock()
+
+	cmd := exec.Command("taskkill", "/F", "/IM", "mod-tools.exe")
+	cmd.SysProcAttr = getSysProcAttr()
+	cmd.Run()
+}
+
+// StopPatcher shuts the patcher host down, for exit, restart and uninstall.
+func StopPatcher() {
+	hostMu.Lock()
+	cmd, stdin := hostProcess, stdinPipe
+	hostProcess, stdinPipe, armed = nil, nil, false
+	hostMu.Unlock()
+
+	// First try to gracefully stop the session; closing stdin tells the host to exit
+	if stdin != nil {
+		sendCommand(stdin, "stop")
+		stdin.Close()
 	}
 
-	// Give it a moment to exit gracefully
-	if runningProcess != nil && runningProcess.Process != nil {
-		// Wait a bit for graceful exit
+	if cmd != nil && cmd.Process != nil {
 		done := make(chan struct{})
 		go func() {
-			runningProcess.Wait()
+			cmd.Wait()
 			close(done)
 		}()
 
 		select {
 		case <-done:
 			// Process exited gracefully
-		case <-time.After(1 * time.Second):
+		case <-time.After(2 * time.Second):
 			// Force kill if still running
-			runningProcess.Process.Kill()
+			cmd.Process.Kill()
 		}
-		runningProcess = nil
 	}
 
-	// Then force kill any remaining mod-tools
-	cmd := exec.Command("taskkill", "/F", "/IM", "mod-tools.exe")
-	cmd.SysProcAttr = getSysProcAttr()
-	cmd.Run()
+	// Then force kill any host left over from a previous ame
+	kill := exec.Command("taskkill", "/F", "/IM", PatcherHostExe)
+	kill.SysProcAttr = getSysProcAttr()
+	kill.Run()
 }
 
 // RunMkOverlay runs mod-tools mkoverlay command
@@ -109,30 +134,59 @@ func RunMkOverlay(modsDir, overlayDir, gameDir, modName string) (bool, int) {
 	return true, 0
 }
 
-// stdinPipe holds the stdin writer for runoverlay (to keep it alive and stop gracefully)
+// PatcherHostExe and PatcherDLL are LTK Manager's injection host and the hook
+// DLL it injects into the game. They replaced mod-tools runoverlay, whose
+// cslol-dll stopped hooking the game after patch 16.19.
+const (
+	PatcherHostExe = "ltk_patcher_host.exe"
+	PatcherDLL     = "ltk_patcher_dll.dll"
+)
+
+// Hook flags sent with "config flags". optOutAHv1 downgrades a failed
+// anti-skinhack WAD scan (status c0000229) from aborting the overlay to a
+// warning; without it the DLL refuses every skin ame builds.
+const optOutAHv1 = 4
+
+// logLevelInfo is the DLL's numeric info log level for "config loglevel".
+const logLevelInfo = 0x10
+
+// stdinPipe holds the host's command pipe (to send "stop" and shut it down)
 var stdinPipe io.WriteCloser
 
-// RunOverlay runs mod-tools runoverlay command (NOT detached, like bocchi)
-func RunOverlay(overlayDir, configPath, gameDir string) error {
-	modTools := filepath.Join(config.ToolsDir, "mod-tools.exe")
+// sendCommand writes one line to the host's stdin.
+func sendCommand(w io.Writer, line string) error {
+	_, err := io.WriteString(w, line+"\n")
+	return err
+}
 
-	if _, err := os.Stat(modTools); os.IsNotExist(err) {
-		return fmt.Errorf("mod-tools.exe not found")
+// StartPatcher starts the patcher host if it isn't running. The host waits
+// for the game and injects the hook DLL, which serves files from overlayDir.
+func StartPatcher(overlayDir string) error {
+	hostMu.Lock()
+	defer hostMu.Unlock()
+
+	if hostProcess != nil {
+		return nil
 	}
 
-	cmd := exec.Command(modTools, "runoverlay",
-		overlayDir, configPath,
-		fmt.Sprintf("--game:%s", gameDir),
-		"--opts:none") // bocchi uses --opts:none
+	host := filepath.Join(config.ToolsDir, PatcherHostExe)
+	if _, err := os.Stat(host); os.IsNotExist(err) {
+		return fmt.Errorf("%s not found", PatcherHostExe)
+	}
 
+	// A host left over from a previous ame would inject a second DLL
+	kill := exec.Command("taskkill", "/F", "/IM", PatcherHostExe)
+	kill.SysProcAttr = getSysProcAttr()
+	kill.Run()
+
+	cmd := exec.Command(host)
 	cmd.Dir = config.ToolsDir
+	cmd.SysProcAttr = getHiddenSysProcAttr()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdin pipe: %v", err)
 	}
-	stdinPipe = stdin
-
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %v", err)
@@ -142,24 +196,46 @@ func RunOverlay(overlayDir, configPath, gameDir string) error {
 		return fmt.Errorf("failed to create stderr pipe: %v", err)
 	}
 
-	err = cmd.Start()
-	if err != nil {
+	if err := cmd.Start(); err != nil {
 		return err
 	}
 
-	runningProcess = cmd
+	// The host reads loglevel, flags, then prefix before start.
+	prefix := overlayDir
+	if !strings.HasSuffix(prefix, string(os.PathSeparator)) {
+		prefix += string(os.PathSeparator)
+	}
+	for _, line := range []string{
+		fmt.Sprintf("config loglevel %d", logLevelInfo),
+		fmt.Sprintf("config flags %d", optOutAHv1),
+		"config prefix " + prefix,
+		"start scan",
+	} {
+		if err := sendCommand(stdin, line); err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return fmt.Errorf("failed to configure patcher: %v", err)
+		}
+	}
 
-	// Reset overlay status for this run
+	hostProcess = cmd
+	stdinPipe = stdin
 	setOverlayStatus("")
 
-	// Read stdout lines and track runoverlay status
+	logFile, _ := os.Create(filepath.Join(config.AmeDir, "patcher.log"))
+
+	// Read host events and track the injection state
 	go func() {
+		if logFile != nil {
+			defer logFile.Close()
+		}
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if strings.HasPrefix(line, "Status: ") {
-				setOverlayStatus(strings.TrimPrefix(line, "Status: "))
+			if logFile != nil {
+				fmt.Fprintln(logFile, line)
 			}
+			handleHostLine(line)
 		}
 	}()
 	go func() {
@@ -168,24 +244,83 @@ func RunOverlay(overlayDir, configPath, gameDir string) error {
 		}
 	}()
 
-	// Monitor process exit
+	// Monitor process exit; the next StartPatcher respawns it
 	go func() {
 		cmd.Wait()
-		runningProcess = nil
-		stdinPipe = nil
+		hostMu.Lock()
+		if hostProcess == cmd {
+			hostProcess = nil
+			stdinPipe = nil
+		}
+		hostMu.Unlock()
+		setOverlayStatus("")
 	}()
 
 	return nil
 }
 
-// Exists checks if mod-tools.exe exists
-func Exists() bool {
-	modTools := filepath.Join(config.ToolsDir, "mod-tools.exe")
-	_, err := os.Stat(modTools)
-	return err == nil
+// RunOverlay arms the overlay built in overlayDir, starting the patcher host
+// if it isn't already waiting for the game.
+func RunOverlay(overlayDir string) error {
+	if err := StartPatcher(overlayDir); err != nil {
+		return err
+	}
+	hostMu.Lock()
+	armed = true
+	hostMu.Unlock()
+	return nil
 }
 
-// IsRunning checks if runoverlay is currently running
+// handleHostLine tracks "status <ts> <state> <msg>" events from the host and
+// surfaces failures and DLL errors in the activity log.
+func handleHostLine(line string) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return
+	}
+	switch fields[0] {
+	case "status":
+		if len(fields) < 3 {
+			return
+		}
+		state := fields[2]
+		msg := strings.Join(fields[3:], " ")
+		switch state {
+		case "waiting":
+			setOverlayStatus(hookedStatus)
+		case "exited", "injecting":
+			setOverlayStatus("")
+		case "failed":
+			setOverlayStatus("")
+			display.Log("Patcher failed: " + msg)
+		}
+	case "error":
+		display.Log("Patcher error: " + strings.Join(fields[2:], " "))
+	case "dll":
+		// "dll <ts> <pid> <tid> <level> <msg...>"
+		if len(fields) < 6 {
+			return
+		}
+		msg := strings.Join(fields[5:], " ")
+		if strings.EqualFold(fields[4], "error") || strings.HasSuffix(msg, "joined too late, not overlaying") {
+			display.Log("Patcher: " + msg)
+		}
+	}
+}
+
+// Exists checks that mod-tools and the patcher binaries are installed
+func Exists() bool {
+	for _, name := range []string{"mod-tools.exe", PatcherHostExe, PatcherDLL} {
+		if _, err := os.Stat(filepath.Join(config.ToolsDir, name)); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// IsRunning checks if an overlay is armed and the patcher host is running
 func IsRunning() bool {
-	return runningProcess != nil && runningProcess.Process != nil
+	hostMu.Lock()
+	defer hostMu.Unlock()
+	return armed && hostProcess != nil
 }

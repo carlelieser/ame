@@ -2,6 +2,10 @@ package setup
 
 import (
 	"archive/zip"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,8 +14,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/bodgit/sevenzip"
 	"github.com/hoangvu12/ame/internal/config"
+	"github.com/hoangvu12/ame/internal/modtools"
 )
 
 var (
@@ -92,10 +99,9 @@ func GetPluginDir() string {
 
 // Config holds setup URLs
 type Config struct {
-	ToolsZipURL string // URL to a .zip containing a tools/ folder
-	PenguURL    string
-	PluginURL   string
-	DevSrcDir   string // When non-empty, copy plugin from this local dir instead of downloading
+	PenguURL  string
+	PluginURL string
+	DevSrcDir string // When non-empty, copy plugin from this local dir instead of downloading
 }
 
 // statusFail prints a failure message (success is silent)
@@ -113,10 +119,6 @@ func downloadFile(url, dest string) error {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
-	}
-
-	if strings.Contains(url, "filebin.net") {
-		req.AddCookie(&http.Cookie{Name: "verified", Value: "2024-05-24"})
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -232,8 +234,21 @@ func createDirectories() {
 	}
 }
 
-// SetupModTools downloads and extracts the mod-tools zip if missing or forced.
-func SetupModTools(toolsZipURL string, force bool) bool {
+// mod-tools comes from a pinned official cslol-manager release. ame only uses
+// it to build overlays (mkoverlay), which doesn't break with game patches, so
+// the release is pinned and the extracted binary checked against its hash.
+const (
+	cslolRelease      = "2026-04-15-23f2308"
+	cslolReleaseURL   = "https://github.com/LeagueToolkit/cslol-manager/releases/download/" + cslolRelease + "/cslol-manager-windows.exe"
+	cslolModToolsPath = "cslol-manager/cslol-tools/mod-tools.exe"
+	modToolsSHA256    = "d4e2f38086275ec51fab57034ae442bc75c1b0f00c725b78cc4cf616ce9b3d42"
+)
+
+// legacyTools were shipped by the old tools zip and are no longer used.
+var legacyTools = []string{"cslol-dll.dll", "cslol-diag.exe", "wad-extract.exe", "wad-make.exe"}
+
+// SetupModTools downloads mod-tools from the cslol-manager release if missing or forced.
+func SetupModTools(force bool) bool {
 	modToolsPath := filepath.Join(config.ToolsDir, "mod-tools.exe")
 	if !force {
 		if _, err := os.Stat(modToolsPath); err == nil {
@@ -241,59 +256,204 @@ func SetupModTools(toolsZipURL string, force bool) bool {
 		}
 	}
 
-	if strings.TrimSpace(toolsZipURL) == "" {
-		statusFail("mod-tools URL missing")
-		return false
-	}
-
 	info("Downloading mod-tools...")
 
-	zipPath := filepath.Join(config.AmeDir, "tools.zip")
-
-	if err := downloadFile(toolsZipURL, zipPath); err != nil {
+	sfxPath := filepath.Join(config.AmeDir, "cslol-manager.exe")
+	if err := downloadFile(cslolReleaseURL, sfxPath); err != nil {
 		statusFail("mod-tools download")
 		return false
 	}
-	defer os.Remove(zipPath)
+	defer os.Remove(sfxPath)
 
-	// Extract to a temp dir first, then move files from the tools/ subfolder
-	tmpDir := filepath.Join(config.AmeDir, "tools_tmp")
-	os.RemoveAll(tmpDir)
-	defer os.RemoveAll(tmpDir)
+	os.MkdirAll(config.ToolsDir, os.ModePerm)
+	tmpPath := modToolsPath + ".new"
+	defer os.Remove(tmpPath)
 
-	if err := extractZip(zipPath, tmpDir); err != nil {
+	if err := extractFromSFX(sfxPath, cslolModToolsPath, tmpPath); err != nil {
 		statusFail("mod-tools extract")
 		return false
 	}
 
-	// The zip contains a tools/ folder — copy its contents to ToolsDir
-	extractedToolsDir := filepath.Join(tmpDir, "tools")
-	entries, err := os.ReadDir(extractedToolsDir)
-	if err != nil {
+	if sum, err := fileSHA256(tmpPath); err != nil || sum != modToolsSHA256 {
+		statusFail("mod-tools verify")
+		return false
+	}
+
+	if err := os.Rename(tmpPath, modToolsPath); err != nil {
 		statusFail("mod-tools setup")
 		return false
 	}
 
-	os.RemoveAll(config.ToolsDir)
-	os.MkdirAll(config.ToolsDir, os.ModePerm)
+	for _, name := range legacyTools {
+		os.Remove(filepath.Join(config.ToolsDir, name))
+	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
+	return true
+}
+
+// sevenZipMagic starts a 7z archive. The cslol-manager release is a 7-Zip
+// self-extractor: a small exe stub with the archive appended.
+var sevenZipMagic = []byte{'7', 'z', 0xBC, 0xAF, 0x27, 0x1C}
+
+// extractFromSFX copies one file out of a 7-Zip self-extracting exe.
+func extractFromSFX(sfxPath, name, dest string) error {
+	f, err := os.Open(sfxPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	// The archive follows the stub, well within the first few MB
+	head := make([]byte, 8<<20)
+	n, err := io.ReadFull(f, head)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return err
+	}
+	head = head[:n]
+
+	// The magic can also occur inside the stub, so take the first offset
+	// that opens as an archive
+	for off := 0; ; off++ {
+		i := bytes.Index(head[off:], sevenZipMagic)
+		if i < 0 {
+			return fmt.Errorf("no 7z archive in %s", sfxPath)
+		}
+		off += i
+
+		size := st.Size() - int64(off)
+		r, err := sevenzip.NewReader(io.NewSectionReader(f, int64(off), size), size)
+		if err != nil {
 			continue
 		}
-		src := filepath.Join(extractedToolsDir, entry.Name())
-		dst := filepath.Join(config.ToolsDir, entry.Name())
-		data, readErr := os.ReadFile(src)
-		if readErr != nil {
-			statusFail("mod-tools setup")
-			return false
+
+		for _, entry := range r.File {
+			if entry.Name != name {
+				continue
+			}
+			rc, err := entry.Open()
+			if err != nil {
+				return err
+			}
+			defer rc.Close()
+
+			out, err := os.Create(dest)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, rc); err != nil {
+				out.Close()
+				return err
+			}
+			return out.Close()
 		}
-		if writeErr := os.WriteFile(dst, data, 0644); writeErr != nil {
-			statusFail("mod-tools setup")
+		return fmt.Errorf("%s not found in archive", name)
+	}
+}
+
+// fileSHA256 returns the hex SHA-256 of a file.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ltkRepo hosts the patcher binaries. LTK Manager refreshes its hook DLL
+// after game patches, so they are fetched from its latest release tag.
+const ltkRepo = "LeagueToolkit/ltk-manager"
+
+// latestLTKTag returns the tag of LTK Manager's latest release.
+func latestLTKTag() (string, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/" + ltkRepo + "/releases/latest")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("bad status: %d", resp.StatusCode)
+	}
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return "", err
+	}
+	if release.TagName == "" {
+		return "", fmt.Errorf("release has no tag")
+	}
+	return release.TagName, nil
+}
+
+// SetupPatcher downloads the LTK patcher host and hook DLL, and refreshes them
+// when LTK Manager publishes a new release. An existing copy is kept when the
+// check or download fails.
+func SetupPatcher() bool {
+	files := []string{modtools.PatcherHostExe, modtools.PatcherDLL}
+	versionPath := filepath.Join(config.ToolsDir, "ltk-patcher.version")
+
+	installed := true
+	for _, name := range files {
+		if _, err := os.Stat(filepath.Join(config.ToolsDir, name)); err != nil {
+			installed = false
+		}
+	}
+
+	tag, err := latestLTKTag()
+	if err != nil {
+		if installed {
+			return true
+		}
+		statusFail("patcher version check")
+		return false
+	}
+
+	if current, _ := os.ReadFile(versionPath); installed && strings.TrimSpace(string(current)) == tag {
+		return true
+	}
+
+	info("Downloading patcher " + tag + "...")
+
+	// Download everything before replacing anything, so a failure never leaves
+	// a host and DLL from different releases.
+	for _, name := range files {
+		url := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/src-tauri/resources/%s", ltkRepo, tag, name)
+		if err := downloadFile(url, filepath.Join(config.ToolsDir, name+".new")); err != nil {
+			for _, n := range files {
+				os.Remove(filepath.Join(config.ToolsDir, n+".new"))
+			}
+			if installed {
+				return true
+			}
+			statusFail("patcher download")
 			return false
 		}
 	}
 
+	for _, name := range files {
+		dst := filepath.Join(config.ToolsDir, name)
+		if err := os.Rename(dst+".new", dst); err != nil {
+			// The host is still running from a previous session; retry next start
+			os.Remove(dst + ".new")
+			return installed
+		}
+	}
+
+	os.WriteFile(versionPath, []byte(tag), 0644)
 	return true
 }
 
@@ -418,7 +578,12 @@ func RunSetup(config Config) bool {
 	createDirectories()
 
 	// Setup mod-tools
-	if !SetupModTools(config.ToolsZipURL, false) {
+	if !SetupModTools(false) {
+		return false
+	}
+
+	// Setup the patcher that injects the overlay into the game
+	if !SetupPatcher() {
 		return false
 	}
 

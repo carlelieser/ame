@@ -257,8 +257,9 @@ func handleUninstall(conn *websocket.Conn) {
 	// Remove startup scheduled task
 	startup.Disable()
 
-	// Clean up overlay state and kill mod-tools
+	// Clean up overlay state and stop mod-tools and the patcher
 	HandleCleanup()
+	modtools.StopPatcher()
 
 	// Kill Pengu Loader process
 	kill := exec.Command("taskkill", "/F", "/IM", "Pengu Loader.exe")
@@ -320,6 +321,11 @@ func handleApply(conn *websocket.Conn, championID, skinID, baseSkinID, championN
 
 	// Nothing to apply: default skin with no auxiliary mods.
 	if !hasSkin && !hasCustomMods && !hasTeammateSkins {
+		// The patcher overlays whatever is in the overlay dir, so a skin left
+		// from the last game would load. Leave it alone mid-game (files are open).
+		if suspend.FindProcess("League of Legends.exe") == 0 {
+			HandleCleanup()
+		}
 		sendStatus(conn, "noop", "Nothing to apply")
 		return
 	}
@@ -333,7 +339,7 @@ func handleApply(conn *websocket.Conn, championID, skinID, baseSkinID, championN
 		currentModKey += ";" + cmk
 	}
 
-	// If runoverlay is already running for this exact mod set, skip — nothing to do
+	// If the patcher is already running for this exact mod set, skip — nothing to do
 	stateMu.Lock()
 	alreadyActive := modtools.IsRunning() && lastModKey == currentModKey
 	display.Log(fmt.Sprintf("Apply: modKey=%s lastModKey=%s running=%v alreadyActive=%v", currentModKey, lastModKey, modtools.IsRunning(), alreadyActive))
@@ -352,7 +358,7 @@ func handleApply(conn *websocket.Conn, championID, skinID, baseSkinID, championN
 
 	// Check mod-tools exists
 	if !modtools.Exists() {
-		sendStatus(conn, "error", "mod-tools.exe not found. Please restart ame.")
+		sendStatus(conn, "error", "Skin tools not found. Please restart ame.")
 		return
 	}
 
@@ -370,11 +376,11 @@ func handleApply(conn *websocket.Conn, championID, skinID, baseSkinID, championN
 		}
 	}
 
-	// Kill any previous runoverlay
+	// Kill any previous patcher
 	modtools.KillModTools()
 	time.Sleep(300 * time.Millisecond)
 
-	// applyDone signals that overlay build + runoverlay start are complete.
+	// applyDone signals that overlay build + patcher start are complete.
 	// The suspend goroutine only freezes the game if it appears BEFORE this closes.
 	applyDone := make(chan struct{})
 	defer close(applyDone)
@@ -605,9 +611,8 @@ func handleApply(conn *websocket.Conn, championID, skinID, baseSkinID, championN
 		teammateSkinCount = roomState.BuiltTeammateSkinCount()
 	}
 
-	// Start runoverlay (hooks game process when it finds it)
-	configPath := filepath.Join(config.OverlayDir, "cslol-config.json")
-	if err := modtools.RunOverlay(config.OverlayDir, configPath, gameDir); err != nil {
+	// Start the patcher (hooks game process when it finds it)
+	if err := modtools.RunOverlay(config.OverlayDir); err != nil {
 		sendStatus(conn, "error", fmt.Sprintf("Failed to start overlay: %v", err))
 		return
 	}

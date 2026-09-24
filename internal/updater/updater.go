@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	GITHUB_REPO    = "hoangvu12/ame"
+	GITHUB_REPO    = "carlelieser/ame"
 	GITHUB_API_URL = "https://api.github.com/repos/" + GITHUB_REPO + "/releases/latest"
 	minExeSize     = 1024 * 1024
 )

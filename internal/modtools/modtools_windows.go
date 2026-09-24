@@ -19,3 +19,11 @@ func getDetachedSysProcAttr() *syscall.SysProcAttr {
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
 }
+
+// getHiddenSysProcAttr returns process attributes that keep a console child
+// from opening its own window
+func getHiddenSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
+}

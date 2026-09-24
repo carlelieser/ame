@@ -20,6 +20,7 @@ import (
 	"github.com/hoangvu12/ame/internal/game"
 	"github.com/hoangvu12/ame/internal/i18n"
 	"github.com/hoangvu12/ame/internal/lcu"
+	"github.com/hoangvu12/ame/internal/modtools"
 	"github.com/hoangvu12/ame/internal/server"
 	"github.com/hoangvu12/ame/internal/setup"
 	"github.com/hoangvu12/ame/internal/startup"
@@ -29,18 +30,14 @@ import (
 // Version is set at build time via -ldflags
 var Version = "dev"
 
-// toolsZipURL is set at build time via -ldflags.
-var toolsZipURL string
-
 const PORT = 18765
 
 var minimized bool
 
 // Setup URLs
 var setupConfig = setup.Config{
-	ToolsZipURL: toolsZipURL,
-	PenguURL:    "https://github.com/PenguLoader/PenguLoader/releases/download/v1.1.6/pengu-loader-v1.1.6.zip",
-	PluginURL:   "https://github.com/hoangvu12/ame/releases/latest/download/plugin.zip",
+	PenguURL:  "https://github.com/PenguLoader/PenguLoader/releases/download/v1.1.6/pengu-loader-v1.1.6.zip",
+	PluginURL: "https://github.com/" + updater.GITHUB_REPO + "/releases/latest/download/plugin.zip",
 }
 
 // findDevSrcDir locates the local plugin source directory relative to the executable.
@@ -99,7 +96,7 @@ func killPenguLoader() {
 func printBanner() {
 	fmt.Println()
 	fmt.Println("  ame " + Version)
-	fmt.Println("  https://github.com/hoangvu12/ame")
+	fmt.Println("  https://github.com/" + updater.GITHUB_REPO)
 	fmt.Println()
 }
 
@@ -128,7 +125,7 @@ func checkForUpdates() {
 	fmt.Printf("  New version: %s (current: %s)\n", result.LatestVersion, Version)
 
 	if !result.Downloaded || !updater.VerifyUpdateFile() {
-		fmt.Println("  Download: https://github.com/hoangvu12/ame/releases/latest")
+		fmt.Println("  Download: https://github.com/" + updater.GITHUB_REPO + "/releases/latest")
 		fmt.Println()
 		return
 	}
@@ -292,6 +289,7 @@ func cleanup() {
 	display.Pause()
 	fmt.Println("\n  Shutting down...")
 	server.HandleCleanup()
+	modtools.StopPatcher()
 
 	killPenguLoader()
 }
@@ -494,7 +492,7 @@ func main() {
 	// Check if plugin reinstall is needed (after an update)
 	if updater.NeedsPluginReinstall(Version) {
 		fmt.Println("  Updating mod-tools...")
-		setup.SetupModTools(setupConfig.ToolsZipURL, true)
+		setup.SetupModTools(true)
 		fmt.Println("  Updating plugin...")
 		setup.DetectAndSetPenguPaths()
 		setup.SetupPlugin(setupConfig.PluginURL)
@@ -546,6 +544,11 @@ func main() {
 
 	display.Init(Version)
 	display.Log("Started")
+
+	// The patcher must already be scanning when the game launches
+	if err := modtools.StartPatcher(config.OverlayDir); err != nil {
+		display.Log(fmt.Sprintf("Failed to start patcher: %v", err))
+	}
 
 	// Run system tray (blocks until quit)
 	runTray()
