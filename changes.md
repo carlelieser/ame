@@ -1,6 +1,3 @@
-- Fixed skins not showing in game after the latest League patch
-- Fixed the game freezing on startup when a skin was selected
-- Skins now keep working after future League patches without waiting for an Ame update
-- Ame now downloads its skin tools straight from their official source
-- Added a log file that helps track down problems when a skin doesn't show up in game
-- Updates and downloads now come from this version of Ame
+- Fixed skins not applying at all after installing or updating to the previous version
+- Fixed Ame sometimes starting an older copy, or a copy from a different version of Ame, instead of the one you downloaded
+- Downloading a newer version of Ame and running it now replaces the older one right away
