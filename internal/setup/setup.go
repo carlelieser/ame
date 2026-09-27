@@ -236,24 +236,43 @@ func createDirectories() {
 
 // mod-tools comes from a pinned official cslol-manager release. ame only uses
 // it to build overlays (mkoverlay), which doesn't break with game patches, so
-// the release is pinned and the extracted binary checked against its hash.
+// the release is pinned and each extracted file checked against its hash.
 const (
-	cslolRelease      = "2026-04-15-23f2308"
-	cslolReleaseURL   = "https://github.com/LeagueToolkit/cslol-manager/releases/download/" + cslolRelease + "/cslol-manager-windows.exe"
-	cslolModToolsPath = "cslol-manager/cslol-tools/mod-tools.exe"
-	modToolsSHA256    = "d4e2f38086275ec51fab57034ae442bc75c1b0f00c725b78cc4cf616ce9b3d42"
+	cslolRelease    = "2026-04-15-23f2308"
+	cslolReleaseURL = "https://github.com/LeagueToolkit/cslol-manager/releases/download/" + cslolRelease + "/cslol-manager-windows.exe"
 )
 
+// cslolFile is one file ame installs from the cslol-manager release.
+type cslolFile struct {
+	archivePath string
+	name        string
+	sha256      string
+}
+
+// modToolsFiles are installed together: mod-tools.exe imports cslol-dll.dll
+// and won't start without it, even though ame no longer injects the DLL.
+var modToolsFiles = []cslolFile{
+	{"cslol-manager/cslol-tools/mod-tools.exe", "mod-tools.exe", "d4e2f38086275ec51fab57034ae442bc75c1b0f00c725b78cc4cf616ce9b3d42"},
+	{"cslol-manager/cslol-tools/cslol-dll.dll", "cslol-dll.dll", "ae12fb633d88cf31a080ef24ec2c08dc398ddc22fd03e5addc45950dfb2f1c28"},
+}
+
 // legacyTools were shipped by the old tools zip and are no longer used.
-var legacyTools = []string{"cslol-dll.dll", "cslol-diag.exe", "wad-extract.exe", "wad-make.exe"}
+var legacyTools = []string{"cslol-diag.exe", "wad-extract.exe", "wad-make.exe"}
+
+// modToolsInstalled reports whether every mod-tools file is present.
+func modToolsInstalled() bool {
+	for _, f := range modToolsFiles {
+		if _, err := os.Stat(filepath.Join(config.ToolsDir, f.name)); err != nil {
+			return false
+		}
+	}
+	return true
+}
 
 // SetupModTools downloads mod-tools from the cslol-manager release if missing or forced.
 func SetupModTools(force bool) bool {
-	modToolsPath := filepath.Join(config.ToolsDir, "mod-tools.exe")
-	if !force {
-		if _, err := os.Stat(modToolsPath); err == nil {
-			return true
-		}
+	if !force && modToolsInstalled() {
+		return true
 	}
 
 	info("Downloading mod-tools...")
@@ -266,22 +285,28 @@ func SetupModTools(force bool) bool {
 	defer os.Remove(sfxPath)
 
 	os.MkdirAll(config.ToolsDir, os.ModePerm)
-	tmpPath := modToolsPath + ".new"
-	defer os.Remove(tmpPath)
 
-	if err := extractFromSFX(sfxPath, cslolModToolsPath, tmpPath); err != nil {
-		statusFail("mod-tools extract")
-		return false
+	// Extract and verify everything before replacing anything
+	for _, f := range modToolsFiles {
+		tmpPath := filepath.Join(config.ToolsDir, f.name+".new")
+		defer os.Remove(tmpPath)
+
+		if err := extractFromSFX(sfxPath, f.archivePath, tmpPath); err != nil {
+			statusFail("mod-tools extract")
+			return false
+		}
+		if sum, err := fileSHA256(tmpPath); err != nil || sum != f.sha256 {
+			statusFail("mod-tools verify")
+			return false
+		}
 	}
 
-	if sum, err := fileSHA256(tmpPath); err != nil || sum != modToolsSHA256 {
-		statusFail("mod-tools verify")
-		return false
-	}
-
-	if err := os.Rename(tmpPath, modToolsPath); err != nil {
-		statusFail("mod-tools setup")
-		return false
+	for _, f := range modToolsFiles {
+		dst := filepath.Join(config.ToolsDir, f.name)
+		if err := os.Rename(dst+".new", dst); err != nil {
+			statusFail("mod-tools setup")
+			return false
+		}
 	}
 
 	for _, name := range legacyTools {
