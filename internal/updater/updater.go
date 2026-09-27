@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"bytes"
 	"debug/pe"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,11 @@ const (
 	GITHUB_API_URL = "https://api.github.com/repos/" + GITHUB_REPO + "/releases/latest"
 	minExeSize     = 1024 * 1024
 )
+
+// coreRepoMarker is embedded in every core built from this repo, so the
+// launcher can tell its own core from one built from another copy of ame
+// (e.g. upstream), which would keep updating from that repo instead.
+var coreRepoMarker = []byte("ame-core-repo:" + GITHUB_REPO + ";")
 
 var (
 	VERSION_FILE     = filepath.Join(config.AmeDir, "version.txt")
@@ -301,14 +307,52 @@ func ApplyPendingUpdate() bool {
 	return true
 }
 
-// BootstrapCore copies the current executable to ame_core.exe if it doesn't exist.
-func BootstrapCore(srcExe string) error {
+// BootstrapCore copies the launcher to ame_core.exe if it doesn't exist, or
+// replaces an installed core that belongs to another repo or is older than
+// the launcher. A core that auto-updated past the launcher is kept.
+func BootstrapCore(srcExe, version string) error {
+	if strings.EqualFold(filepath.Clean(srcExe), filepath.Clean(CORE_FILE)) {
+		return nil
+	}
 	if verifyExeFile(CORE_FILE) {
-		return nil // already exists
+		if !coreNeedsReplace(version) {
+			return nil
+		}
+		// A core that is running can't be replaced; keep it and retry next launch
+		replaceFile(srcExe, CORE_FILE)
+		return nil
 	}
 	os.Remove(CORE_FILE)
 	os.MkdirAll(config.AmeDir, os.ModePerm)
 	return copyFile(srcExe, CORE_FILE)
+}
+
+// coreNeedsReplace reports whether the installed core was built from another
+// repo, or is older than the launcher (by the version it last recorded).
+func coreNeedsReplace(launcherVersion string) bool {
+	data, err := os.ReadFile(CORE_FILE)
+	if err != nil {
+		return true
+	}
+	if !bytes.Contains(data, coreRepoMarker) {
+		return true
+	}
+	return compareVersions(GetSavedVersion(), launcherVersion)
+}
+
+// replaceFile copies src over dst through a temporary file, so a failed copy
+// never leaves dst truncated.
+func replaceFile(src, dst string) error {
+	tmp := dst + ".tmp"
+	if err := copyFile(src, tmp); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // CorePath returns the path to ame_core.exe

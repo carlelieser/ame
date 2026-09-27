@@ -330,7 +330,7 @@ func runLauncher() {
 	}
 
 	// Bootstrap: copy self to ame_core.exe if it doesn't exist yet
-	if err := updater.BootstrapCore(exePath); err != nil {
+	if err := updater.BootstrapCore(exePath, Version); err != nil {
 		fmt.Printf("  ! Failed to bootstrap core: %v\n", err)
 		os.Exit(1)
 	}
