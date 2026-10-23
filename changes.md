@@ -1,3 +1,1 @@
-- Fixed skins not applying at all after installing or updating to the previous version
-- Fixed Ame sometimes starting an older copy, or a copy from a different version of Ame, instead of the one you downloaded
-- Downloading a newer version of Ame and running it now replaces the older one right away
+- Fixed skins not applying after the latest League Toolkit patcher update
