@@ -1,1 +1,1 @@
-- Fixed skins not applying after the latest League Toolkit patcher update
+- Fixed skins still not applying after the previous update
