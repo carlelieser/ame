@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/bodgit/sevenzip"
 	"github.com/hoangvu12/ame/internal/config"
@@ -395,38 +393,18 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ltkRepo hosts the patcher binaries. LTK Manager refreshes its hook DLL
-// after game patches, so they are fetched from its latest release tag.
+// ltkRepo hosts the patcher binaries.
 const ltkRepo = "LeagueToolkit/ltk-manager"
 
-// latestLTKTag returns the tag of LTK Manager's latest release.
-func latestLTKTag() (string, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get("https://api.github.com/repos/" + ltkRepo + "/releases/latest")
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+// ltkTag pins the LTK Manager release the patcher binaries come from. From
+// v1.30.0 the hook DLL refuses to overlay unless its host was launched by
+// ltk-manager.exe (VRF00000008), so later releases do not work with ame.
+// Bumping this past v1.29.1 brings that check back.
+const ltkTag = "v1.29.1"
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("bad status: %d", resp.StatusCode)
-	}
-
-	var release struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return "", err
-	}
-	if release.TagName == "" {
-		return "", fmt.Errorf("release has no tag")
-	}
-	return release.TagName, nil
-}
-
-// SetupPatcher downloads the LTK patcher host and hook DLL, and refreshes them
-// when LTK Manager publishes a new release. An existing copy is kept when the
-// check or download fails.
+// SetupPatcher downloads the LTK patcher host and hook DLL from the pinned
+// release, replacing any copy from another release. An existing copy is kept
+// when the download fails.
 func SetupPatcher() bool {
 	files := []string{modtools.PatcherHostExe, modtools.PatcherDLL}
 	versionPath := filepath.Join(config.ToolsDir, "ltk-patcher.version")
@@ -438,15 +416,7 @@ func SetupPatcher() bool {
 		}
 	}
 
-	tag, err := latestLTKTag()
-	if err != nil {
-		if installed {
-			return true
-		}
-		statusFail("patcher version check")
-		return false
-	}
-
+	tag := ltkTag
 	if current, _ := os.ReadFile(versionPath); installed && strings.TrimSpace(string(current)) == tag {
 		return true
 	}
