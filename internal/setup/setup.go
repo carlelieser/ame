@@ -2,8 +2,10 @@ package setup
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 	"github.com/bodgit/sevenzip"
 	"github.com/hoangvu12/ame/internal/config"
 	"github.com/hoangvu12/ame/internal/modtools"
+	"github.com/ulikunitz/xz/lzma"
 )
 
 var (
@@ -393,63 +396,164 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ltkRepo hosts the patcher binaries.
-const ltkRepo = "LeagueToolkit/ltk-manager"
+// The patcher comes from a pinned official LTK Manager installer. From v1.30.0
+// the hook DLL refuses to overlay unless its host was launched by
+// ltk-manager.exe (VRF00000008), so later releases do not work with ame. The
+// copies committed to the ltk-manager repo can't be used instead: the v1.29.1
+// DLL there is unsigned and never attaches to the game.
+const (
+	ltkRelease    = "v1.29.1"
+	ltkReleaseURL = "https://github.com/LeagueToolkit/ltk-manager/releases/download/" + ltkRelease + "/LTK.Manager_1.29.1_x64-setup.exe"
+)
 
-// ltkTag pins the LTK Manager release the patcher binaries come from. From
-// v1.30.0 the hook DLL refuses to overlay unless its host was launched by
-// ltk-manager.exe (VRF00000008), so later releases do not work with ame.
-// Bumping this past v1.29.1 brings that check back.
-const ltkTag = "v1.29.1"
+// ltkFile is one file ame installs from the LTK Manager installer.
+type ltkFile struct {
+	name   string
+	size   int64
+	sha256 string
+}
 
-// SetupPatcher downloads the LTK patcher host and hook DLL from the pinned
+// patcherFiles are installed together, since the host and DLL speak a
+// protocol that changes between releases.
+var patcherFiles = []ltkFile{
+	{modtools.PatcherHostExe, 1238272, "23fa1aaeda1a0c743da44227f179084e1fb81c7cd262144a3c8604ffc49d3bc1"},
+	{modtools.PatcherDLL, 770328, "3dce3ac99e55839559129e32ae9de75ddaec40f310118475248f99c61656ecf5"},
+}
+
+// patcherInstalled reports whether every patcher file matches the pinned release.
+func patcherInstalled() bool {
+	for _, f := range patcherFiles {
+		if sum, err := fileSHA256(filepath.Join(config.ToolsDir, f.name)); err != nil || sum != f.sha256 {
+			return false
+		}
+	}
+	return true
+}
+
+// SetupPatcher installs the LTK patcher host and hook DLL from the pinned
 // release, replacing any copy from another release. An existing copy is kept
 // when the download fails.
 func SetupPatcher() bool {
-	files := []string{modtools.PatcherHostExe, modtools.PatcherDLL}
-	versionPath := filepath.Join(config.ToolsDir, "ltk-patcher.version")
+	if patcherInstalled() {
+		return true
+	}
 
 	installed := true
-	for _, name := range files {
-		if _, err := os.Stat(filepath.Join(config.ToolsDir, name)); err != nil {
+	for _, f := range patcherFiles {
+		if _, err := os.Stat(filepath.Join(config.ToolsDir, f.name)); err != nil {
 			installed = false
 		}
 	}
 
-	tag := ltkTag
-	if current, _ := os.ReadFile(versionPath); installed && strings.TrimSpace(string(current)) == tag {
-		return true
+	info("Downloading patcher " + ltkRelease + "...")
+
+	setupPath := filepath.Join(config.AmeDir, "ltk-manager-setup.exe")
+	defer os.Remove(setupPath)
+	for _, f := range patcherFiles {
+		defer os.Remove(filepath.Join(config.ToolsDir, f.name+".new"))
 	}
 
-	info("Downloading patcher " + tag + "...")
-
-	// Download everything before replacing anything, so a failure never leaves
-	// a host and DLL from different releases.
-	for _, name := range files {
-		url := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/src-tauri/resources/%s", ltkRepo, tag, name)
-		if err := downloadFile(url, filepath.Join(config.ToolsDir, name+".new")); err != nil {
-			for _, n := range files {
-				os.Remove(filepath.Join(config.ToolsDir, n+".new"))
-			}
-			if installed {
-				return true
-			}
-			statusFail("patcher download")
-			return false
+	// Extract and verify everything before replacing anything, so a failure
+	// never leaves a host and DLL from different releases.
+	if err := downloadFile(ltkReleaseURL, setupPath); err != nil {
+		if installed {
+			return true
 		}
+		statusFail("patcher download")
+		return false
+	}
+	if err := extractFromNSIS(setupPath, patcherFiles, config.ToolsDir); err != nil {
+		if installed {
+			return true
+		}
+		statusFail("patcher extract")
+		return false
 	}
 
-	for _, name := range files {
-		dst := filepath.Join(config.ToolsDir, name)
+	for _, f := range patcherFiles {
+		dst := filepath.Join(config.ToolsDir, f.name)
 		if err := os.Rename(dst+".new", dst); err != nil {
 			// The host is still running from a previous session; retry next start
-			os.Remove(dst + ".new")
 			return installed
 		}
 	}
 
-	os.WriteFile(versionPath, []byte(tag), 0644)
+	// Older versions tracked the release here; the hashes replace it
+	os.Remove(filepath.Join(config.ToolsDir, "ltk-patcher.version"))
 	return true
+}
+
+// nsisMagic follows the 4-byte flags of an NSIS installer's first header.
+var nsisMagic = []byte("\xef\xbe\xad\xdeNullsoftInst")
+
+// extractFromNSIS writes each of files found in an NSIS installer to
+// destDir/<name>.new. The installer must be built with solid LZMA, which
+// stores every file as a 4-byte length followed by its bytes in one stream.
+// A file is matched by its size and SHA-256, as NSIS keeps no names there.
+func extractFromNSIS(setupPath string, files []ltkFile, destDir string) error {
+	data, err := os.ReadFile(setupPath)
+	if err != nil {
+		return err
+	}
+
+	sig := bytes.Index(data, nsisMagic)
+	if sig < 4 {
+		return fmt.Errorf("no NSIS header in %s", setupPath)
+	}
+	// flags, magic, header length and total length come before the data
+	stream := data[sig-4+28:]
+	if len(stream) < 5 {
+		return fmt.Errorf("truncated NSIS data in %s", setupPath)
+	}
+
+	// NSIS writes LZMA properties and dictionary size without the classic
+	// header's uncompressed size, so mark the size as unknown
+	header := append(append([]byte{}, stream[:5]...), bytes.Repeat([]byte{0xFF}, 8)...)
+	lr, err := lzma.NewReader(io.MultiReader(bytes.NewReader(header), bytes.NewReader(stream[5:])))
+	if err != nil {
+		return err
+	}
+	r := bufio.NewReader(lr)
+
+	remaining := len(files)
+	found := make([]bool, len(files))
+	for remaining > 0 {
+		var n uint32
+		if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+			return fmt.Errorf("%d patcher files not found in installer: %w", remaining, err)
+		}
+		if n&0x80000000 != 0 {
+			return fmt.Errorf("installer is not solid LZMA")
+		}
+
+		match := -1
+		for i, f := range files {
+			if !found[i] && f.size == int64(n) {
+				match = i
+			}
+		}
+		if match < 0 {
+			if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
+				return err
+			}
+			continue
+		}
+
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return err
+		}
+		sum := sha256.Sum256(buf)
+		if hex.EncodeToString(sum[:]) != files[match].sha256 {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(destDir, files[match].name+".new"), buf, 0644); err != nil {
+			return err
+		}
+		found[match] = true
+		remaining--
+	}
+	return nil
 }
 
 // setupPenguLoader detects existing installation or downloads Pengu Loader.
